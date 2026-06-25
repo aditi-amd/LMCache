@@ -35,6 +35,16 @@ __host__ __device__ __forceinline__ bool is_mla(
          engine_kv_format == EngineKVFormat::NL_X_NBBS_ONE_HS;  // SGLang MLA
 }
 
+// inline helper for single-plane (kv_size == 1) formats. MLA and the
+// combined-KV packed-slot format both store one opaque per-token plane, so
+// the transfer kernel launches a grid with k_or_v extent 1 and treats
+// scalars_per_token as the whole per-token run.
+__host__ __device__ __forceinline__ bool is_combined_plane(
+    const EngineKVFormat engine_kv_format) {
+  return is_mla(engine_kv_format) ||
+         engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_PACKED;
+}
+
 // inline helper to check HND layout (callable from device and host)
 __host__ __device__ __forceinline__ bool is_hnd(
     const EngineKVFormat engine_kv_format) {
@@ -263,9 +273,15 @@ __device__ __forceinline__ int64_t page_buffer_offset(
            k_or_v * block_size * scalars_per_token +
            block_offset * scalars_per_token + scalar_offset;
   }
-  // MLA formats: vLLM (NL_X_NB_BS_HS) and SGLang (NL_X_NBBS_ONE_HS)
+  // MLA formats: vLLM (NL_X_NB_BS_HS) and SGLang (NL_X_NBBS_ONE_HS), plus the
+  // combined-KV packed-slot format (NL_X_NB_BS_NH_PACKED). All three are a
+  // single per-token plane (kv_size == 1) whose scalars_per_token bytes are
+  // contiguous, so the offset is the same token-major form. For packed,
+  // scalars_per_token == num_heads * slot_size, i.e. the whole opaque
+  // (K codes + V codes + fp16 metadata) run for one token.
   else if constexpr (format == EngineKVFormat::NL_X_NB_BS_HS ||
-                     format == EngineKVFormat::NL_X_NBBS_ONE_HS) {
+                     format == EngineKVFormat::NL_X_NBBS_ONE_HS ||
+                     format == EngineKVFormat::NL_X_NB_BS_NH_PACKED) {
     return token_idx * scalars_per_token + scalar_offset;
   }
   // vllm flash attention (HND) — physical: [2, NB, NH, BS, HS]
@@ -550,7 +566,7 @@ void multi_layer_kv_transfer_templated(
   lmc::check_block_size(engine_kv_format, block_size);
   lmc::check_head_size(engine_kv_format, head_size_xword);
 
-  int k_or_v_size = lmc::is_mla(engine_kv_format) ? 1 : 2;
+  int k_or_v_size = lmc::is_combined_plane(engine_kv_format) ? 1 : 2;
 
   dim3 grid(num_transfer_tokens, num_layers, k_or_v_size);
   dim3 block(std::min(num_xwords, 128));
@@ -576,6 +592,10 @@ void multi_layer_kv_transfer_templated(
         break;
       case EngineKVFormat::NL_X_NBBS_ONE_HS:
         LAUNCH_KERNEL_WITH_FORMAT(T, false, EngineKVFormat::NL_X_NBBS_ONE_HS);
+        break;
+      case EngineKVFormat::NL_X_NB_BS_NH_PACKED:
+        LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                  EngineKVFormat::NL_X_NB_BS_NH_PACKED);
         break;
       case EngineKVFormat::NL_X_TWO_NB_NH_BS_HS:
         LAUNCH_KERNEL_WITH_FORMAT(T, false,
@@ -606,6 +626,10 @@ void multi_layer_kv_transfer_templated(
         break;
       case EngineKVFormat::NL_X_NBBS_ONE_HS:
         LAUNCH_KERNEL_WITH_FORMAT(T, true, EngineKVFormat::NL_X_NBBS_ONE_HS);
+        break;
+      case EngineKVFormat::NL_X_NB_BS_NH_PACKED:
+        LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                  EngineKVFormat::NL_X_NB_BS_NH_PACKED);
         break;
       case EngineKVFormat::NL_X_TWO_NB_NH_BS_HS:
         LAUNCH_KERNEL_WITH_FORMAT(T, true,

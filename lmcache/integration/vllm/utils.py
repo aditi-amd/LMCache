@@ -36,13 +36,73 @@ def is_false(value: str) -> bool:
     return value.lower() in ("false", "0", "no", "n", "off")
 
 
-def vllm_layout_hints() -> "LayoutHints":
-    """Build layout_hints dict by querying vLLM at runtime."""
-    hints: dict[str, str] = {}
+def vllm_layout_hints(
+    kv_caches: "dict[str, torch.Tensor] | None" = None,
+) -> "LayoutHints":
+    """Build layout_hints dict by querying vLLM at runtime.
+
+    When *kv_caches* is supplied, the registered tensors are inspected for a
+    combined-KV packed-slot layout (TurboQuant TQ44 / FP4-g32 / FP8-g32).
+    Those backends register a per-layer **4-D** ``[NB, BS, NH, slot]`` tensor:
+    the opaque packed slot holds both K and V plus their fp16 metadata.
+
+    Detection is by **tensor rank**, not dtype: real (unquantized) vLLM KV
+    caches carry a leading ``2`` axis (``[2, NB, BS, NH, HS]``, 5-D) to keep K
+    and V separate, whereas the combined packed cache drops that axis and is
+    4-D ``[NB, BS, NH, slot]``. The packed buffer is allocated as ``uint8``
+    (1 byte == 1 byte of the opaque slot); ``slot`` is the per-(token, head)
+    byte count (e.g. 134 for TQ44). A rank check is the robust discriminator
+    because it does not depend on the quant scheme's container dtype.
+
+    TurboQuant additionally applies *boundary protection*: the first/last N
+    attention layers stay native bf16 (5-D), so a real stack is **mixed**
+    (some 5-D bf16, most 4-D packed). Presence of *any* 4-D layer means the
+    packed transfer path must be engaged. Because LMCache's single-call
+    transfer kernel cannot mix per-layer geometries, the mixed stack is
+    handled upstream (boundary layers are kept engine-local / excluded);
+    discovery here only needs to recognize the packed substack. Emitting
+    ``kv_layout="PACKED"`` makes discovery keep the packed slot intact instead
+    of splitting the even trailing dim into a spurious ``2 * head_size`` pair.
+    """
+    hints: dict[str, object] = {}
+    if kv_caches is not None and _is_packed_kv_caches(kv_caches):
+        hints["kv_layout"] = "PACKED"
+        slot = _packed_slot_size(kv_caches)
+        if slot is not None:
+            hints["packed_slot_size"] = slot
+        logger.info(
+            "Detected packed-slot quantized KV cache (slot_size=%s); "
+            "using kv_layout=PACKED",
+            slot,
+        )
+        return hints  # type: ignore[return-value]
     kv_layout = try_get_vllm_kv_cache_layout()
     if kv_layout is not None:
         hints["kv_layout"] = kv_layout
     return hints  # type: ignore[return-value]
+
+
+def _is_packed_kv_caches(kv_caches: "dict[str, torch.Tensor]") -> bool:
+    """True when *any* registered KV cache is a 4-D combined packed-slot tensor.
+
+    Detection is by rank, not dtype. Real (unquantized) vLLM caches are 5-D
+    ``[2, NB, BS, NH, HS]`` (leading K/V axis); the combined packed cache is
+    4-D ``[NB, BS, NH, slot]``. A stack may be *mixed* (TurboQuant boundary
+    protection keeps a few layers native 5-D bf16). The presence of any 4-D
+    layer means the packed path must be engaged.
+    """
+    for t in kv_caches.values():
+        if isinstance(t, torch.Tensor) and t.dim() == 4:
+            return True
+    return False
+
+
+def _packed_slot_size(kv_caches: "dict[str, torch.Tensor]") -> Optional[int]:
+    """Return the packed slot size (trailing dim) of the first 4-D layer."""
+    for t in kv_caches.values():
+        if isinstance(t, torch.Tensor) and t.dim() == 4:
+            return int(t.shape[3])
+    return None
 
 
 def try_get_vllm_kv_cache_layout() -> Literal["NHD", "HND"] | None:

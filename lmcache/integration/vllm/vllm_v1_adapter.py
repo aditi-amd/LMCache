@@ -759,6 +759,31 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._manager.post_init()
 
+        # Eagerly bind the registered tensors to the GPU connector. Group-aware
+        # connectors (V3) need their per-group geometry built before the first
+        # store/retrieve allocates a transfer buffer, because the buffer shape
+        # comes from ``metadata.get_shapes()`` which is only per-group once the
+        # connector has populated ``metadata.kv_layer_groups_manager``. This is
+        # a no-op for connectors that discover geometry lazily.
+        engine = self.lmcache_engine
+        if (
+            engine is not None
+            and engine.gpu_connector is not None
+            and os.environ.get("LMCACHE_DISABLE_EAGER_KV_REGISTER") != "1"
+        ):
+            try:
+                engine.gpu_connector.register_kv_caches(list(kv_caches.values()))
+            except Exception:
+                # Eager init is an optimization for correct buffer sizing; if it
+                # fails here (e.g. an unexpected device state at registration),
+                # fall back to the lazy per-transfer init path rather than
+                # breaking registration outright.
+                logger.warning(
+                    "Eager GPU connector KV-cache registration failed; "
+                    "falling back to lazy initialization on first transfer.",
+                    exc_info=True,
+                )
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -1845,16 +1870,20 @@ class LMCacheConnectorV1Impl:
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED:
-            # Notify storage backends of aborted requests
-            assert self.lmcache_engine is not None
-            sm = self.lmcache_engine.storage_manager
-            if sm is not None:
-                sm.cancel_request(request.request_id)
+            # request_finished runs on the scheduler-side connector, where the
+            # LMCache engine is not instantiated (it lives on the worker side).
+            # When a request is cancelled mid-flight the storage manager only
+            # exists on the worker, so skip the local notify instead of asserting
+            # (the assert here would tear down EngineCore on every abort).
+            if self.lmcache_engine is not None:
+                # Notify storage backends of aborted requests
+                sm = self.lmcache_engine.storage_manager
+                if sm is not None:
+                    sm.cancel_request(request.request_id)
 
-            if self.async_loading:
+            if self.async_loading and self.lookup_client is not None:
                 # Cancel any ongoing async lookup and prefetch tasks on workers
                 lookup_id = request.request_id
-                assert self.lookup_client is not None
                 self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
         params = (

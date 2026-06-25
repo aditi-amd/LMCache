@@ -109,6 +109,20 @@ enum class EngineKVFormat : int {
   Currently only reached via the host gather/scatter path, not the CUDA
   transfer kernels.
   */
+
+  NL_X_NB_BS_NH_PACKED = 11,
+  /*
+  used by:
+  - vLLM packed-slot quantized KV caches (TurboQuant TQ44 FlyDSL v4,
+    FP4-g32, FP8-g32).
+  physical shape per layer: [num_blocks, block_size, num_heads, slot_size]
+  where slot_size is an opaque packed byte run holding BOTH K and V codes
+  plus their fp16 metadata for one (token, head). The slot is copied
+  verbatim (kv_size == 1, non-MLA); it is NOT 2 * head_size and is never
+  split. ``head_size`` carries slot_size, ``element_size`` is 1 (uint8).
+  Address math is the same single-plane, token-major form as MLA:
+  ``token_idx * scalars_per_token + scalar_offset``.
+  */
 };
 
 void multi_layer_kv_transfer(

@@ -296,6 +296,20 @@ class EngineKVFormat(IntEnum):
     # second-to-last, recovered by splitting the fused [..., 2 * head_size].
     NL_X_NB_NH_BS_TWO_HS = 10
 
+    # used by: vLLM packed-slot quantized KV caches (TurboQuant TQ44 FlyDSL v4,
+    # FP4-g32, FP8-g32). Per-layer physical shape
+    # [num_blocks, block_size, num_heads, slot_size] where ``slot_size`` is an
+    # opaque packed byte run holding BOTH K and V codes plus their fp16
+    # metadata (norm / scale / zero) for one (token, head). The slot is NOT a
+    # 2 * head_size fused K/V pair and MUST NOT be split: K and V have unequal
+    # byte widths and, under the SoA store layout, the metadata lives in a
+    # per-block tail region rather than adjacent to the codes. Transfers are
+    # therefore performed at whole-block granularity, copying the entire
+    # ``block_size * num_heads * slot_size`` byte run per block verbatim
+    # (kv_size == 1, non-MLA). ``hs`` in the shape desc carries the packed
+    # ``slot_size`` (in element/byte units, element_size == 1 for uint8).
+    NL_X_NB_BS_NH_PACKED = 11
+
 
 # Backward-compat alias
 GPUKVFormat = EngineKVFormat
@@ -791,6 +805,16 @@ def _is_mla_format(engine_kv_format: EngineKVFormat) -> bool:
     )
 
 
+def _is_packed_format(engine_kv_format: EngineKVFormat) -> bool:
+    """Return True for combined-KV packed-slot formats (TQ44 / FP4-g32 / FP8-g32).
+
+    These store K and V (plus their fp16 metadata) in one opaque packed byte
+    slot per (token, head). The slot must be copied verbatim at whole-block
+    granularity; it is never split into a K/V pair.
+    """
+    return int(engine_kv_format) == int(EngineKVFormat.NL_X_NB_BS_NH_PACKED)
+
+
 _ELEMENT_SIZE_TO_DTYPE: dict[int, torch.dtype] = {
     # Maps the byte width of a KV-cache element to a representative torch dtype.
     # Only widths that commonly appear in KV caches are listed; 1-byte entries
@@ -845,6 +869,12 @@ def _per_layer_paged_shape(
         # vLLM CPU blocks-first fused KV: K and V interleaved at the
         # second-to-last dim so each layer is [NB, NH, BS, 2, HS].
         return (nb, nh, bs, 2, hs)
+    if fmt == int(EngineKVFormat.NL_X_NB_BS_NH_PACKED):
+        # Packed-slot combined-KV (TQ44 / FP4-g32 / FP8-g32): each layer is
+        # [NB, BS, NH, slot_size]. ``hs`` carries the opaque packed slot size
+        # (bytes, with element_size == 1). The slot is copied verbatim — no
+        # leading 2 K/V axis, no split.
+        return (nb, bs, nh, hs)
     if fmt == int(EngineKVFormat.NL_X_TWO_NB_BS_NH_HS):
         return (2, nb, bs, nh, hs)
     if fmt == int(EngineKVFormat.NL_X_NB_NH_BS_TWO_HS):
@@ -1073,6 +1103,10 @@ def _normalize_lmcache_objects(
         chunk_tokens = lmcache_chunk_size
         if _is_mla_format(engine_kv_format):
             chunk_shape: tuple[int, ...] = (nl, chunk_tokens, hs)
+        elif _is_packed_format(engine_kv_format):
+            # Combined-KV packed slot: one opaque plane (kv_size == 1) holding
+            # nh * slot_size bytes per token. ``hs`` carries slot_size.
+            chunk_shape = (nl, chunk_tokens, nh * hs)
         else:
             chunk_shape = (2, nl, chunk_tokens, nh * hs)
         return [
@@ -1182,6 +1216,18 @@ def multi_layer_block_kv_transfer(
         )
     elif _is_sglang_mha_format(engine_kv_format):
         _transfer_sglang_mha(
+            normalized,
+            object_tensors,
+            block_ids,
+            n_block_ids,
+            blocks_per_object,
+            block_size,
+            engine_kv_format,
+            is_d2h,
+            skip_prefix_n_blocks,
+        )
+    elif _is_packed_format(engine_kv_format):
+        _transfer_per_layer_packed(
             normalized,
             object_tensors,
             block_ids,
@@ -1511,6 +1557,79 @@ def _transfer_per_layer_mla(
                 else:
                     src_blocks = src.reshape(n_valid, block_size, hidden_size)
                     layer.index_copy_(0, eff_idx, src_blocks)
+
+
+def _transfer_per_layer_packed(
+    layer_tensors: list[torch.Tensor],
+    object_tensors: list[torch.Tensor],
+    block_ids: torch.Tensor | list[int],
+    n_block_ids: int,
+    blocks_per_object: int,
+    block_size: int,
+    engine_kv_format: EngineKVFormat,
+    is_d2h: bool,
+    skip_prefix_n_blocks: int,
+) -> None:
+    """Handle combined-KV packed-slot formats: per-layer ``[NB, BS, NH, slot]``.
+
+    The packed slot (K codes + V codes + fp16 metadata) is copied verbatim at
+    whole-block granularity. There is no K/V split and no per-element
+    interpretation: a token's full ``NH * slot`` bytes are moved as one opaque
+    row, and a block's ``BS`` rows are gathered/scattered together. Because the
+    physical per-block byte span (``BS * NH * slot``) is identical whether the
+    store used AoS or SoA layout, this block-granular copy captures the SoA
+    metadata tail as well — no scale-aware logic is required.
+
+    Object layout (single combined plane, kv_size == 1):
+        ``obj[NL, chunk_tokens, NH * slot]``.
+    """
+    if not layer_tensors or not object_tensors:
+        return
+
+    target_device = layer_tensors[0].device
+    block_ids_dev = torch.as_tensor(block_ids, dtype=torch.long, device=target_device)
+
+    for object_idx, obj in enumerate(object_tensors):
+        valid = _valid_block_range_indices(
+            object_idx,
+            n_block_ids,
+            blocks_per_object,
+            block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        idx_start, idx_end, offset_in_object = valid
+        n_valid = idx_end - idx_start
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = block_ids_dev[idx_start:idx_end]
+
+        if is_d2h:
+            # Gather whole blocks [n_valid, BS, NH, slot] -> flat token rows
+            # [n_valid * BS, NH * slot] and write into the combined object plane.
+            chunk_gpu = torch.empty(
+                len(layer_tensors),
+                n_valid * block_size,
+                obj.shape[-1],
+                dtype=layer_tensors[0].dtype,
+                device=target_device,
+            )
+            for layer_idx, layer in enumerate(layer_tensors):
+                # layer: [NB, BS, NH, slot]
+                gathered = layer.index_select(0, eff_idx)
+                chunk_gpu[layer_idx] = gathered.reshape(
+                    n_valid * block_size, obj.shape[-1]
+                )
+            obj[:, offset_in_object:token_end].copy_(chunk_gpu, non_blocking=True)
+        else:
+            chunk_gpu = obj[:, offset_in_object:token_end].to(
+                target_device, non_blocking=True
+            )
+            for layer_idx, layer in enumerate(layer_tensors):
+                # layer: [NB, BS, NH, slot]
+                _nb, bs, nh, slot = layer.shape
+                src_blocks = chunk_gpu[layer_idx].reshape(n_valid, bs, nh, slot)
+                layer.index_copy_(0, eff_idx, src_blocks)
 
 
 def _transfer_per_layer_hnd(

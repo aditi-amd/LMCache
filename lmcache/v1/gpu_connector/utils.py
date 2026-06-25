@@ -35,6 +35,123 @@ import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
+
+def _packed_format() -> "Optional[lmc_ops.EngineKVFormat]":
+    """Resolve the combined-KV packed-slot format enum, or ``None``.
+
+    The ``NL_X_NB_BS_NH_PACKED`` value is defined in the pure-Python
+    ``EngineKVFormat`` fallback unconditionally, but only appears in the
+    compiled ``lmc_ops`` enum after the HIP/C++ extension is rebuilt. Resolve
+    it defensively so the discovery + accessor code imports cleanly on a
+    not-yet-rebuilt extension (the packed branch is simply never selected
+    there). Returns the active enum's member when available, else ``None``.
+    """
+    return getattr(lmc_ops.EngineKVFormat, "NL_X_NB_BS_NH_PACKED", None)
+
+
+def _is_packed_format(engine_kv_format: "lmc_ops.EngineKVFormat") -> bool:
+    """True when *engine_kv_format* is the combined-KV packed-slot format."""
+    packed = _packed_format()
+    return packed is not None and int(engine_kv_format) == int(packed)
+
+
+def detect_per_layer_formats(
+    kv_caches: "DiscoverableKVCache",
+    serving_engine: "EngineType",
+    layout_hints: "LayoutHints | None" = None,
+) -> list["lmc_ops.EngineKVFormat"]:
+    """Classify the :class:`EngineKVFormat` of *each* per-layer KV tensor.
+
+    Homogeneous stacks (every layer same rank/dtype) are the common case and
+    are handled by :func:`normalize_kv_and_discover_format`, which probes a
+    single representative layer and returns one global format. That single
+    probe is wrong for *mixed* stacks -- e.g. TurboQuant TQ44 boundary
+    protection keeps the first/last few layers as native bf16 5-D
+    (``NL_X_TWO_NB_BS_NH_HS``) while the middle layers are packed 4-D uint8
+    (``NL_X_NB_BS_NH_PACKED``). Striding a packed layer with bf16 geometry (or
+    vice-versa) reads out of bounds -> GPU memory fault / silent corruption.
+
+    This helper returns one format per registered layer so the grouping layer
+    can split a mixed stack into per-format kernel groups and dispatch each
+    group's transfer with its own geometry.
+
+    Only the vLLM per-layer-list layout is supported for genuine mixing; for
+    every other engine/layout we fall back to the single-probe global format
+    replicated across all layers (those engines do not mix formats per-layer).
+
+    Args:
+        kv_caches: Registered KV cache structure (already normalized by the
+            caller via :func:`normalize_kv_and_discover_format`, or raw).
+        serving_engine: Which serving engine produced the caches.
+        layout_hints: See :class:`LayoutHints`. A ``kv_layout="PACKED"`` hint
+            enables packed/bf16 per-layer classification.
+
+    Returns:
+        ``list[EngineKVFormat]`` of length ``num_layers`` in registration
+        order.
+    """
+    if layout_hints is None:
+        layout_hints = {}
+
+    # Only the depth-1 vLLM per-layer list can legitimately mix formats. For
+    # the packed deployment the stack is a flat ``list[Tensor]`` where each
+    # entry is one layer's physical tensor.
+    is_vllm_layer_list = (
+        serving_engine == EngineType.VLLM
+        and isinstance(kv_caches, (list, tuple))
+        and len(kv_caches) > 0
+        and all(isinstance(t, torch.Tensor) for t in kv_caches)
+    )
+
+    is_packed_hint = layout_hints.get("kv_layout") == "PACKED"
+    ranks = (
+        {t.dim() for t in kv_caches} if is_vllm_layer_list else set()
+    )
+    # A genuine *mix* of 4-D and 5-D per-layer tensors is unambiguous TQ44
+    # boundary protection: the 5-D layers (leading K/V axis) prove the stack is
+    # the standard non-MLA layout, so the 4-D layers can only be combined packed
+    # slots (a 4-D fused-K/V cache would be uniform across all layers, never
+    # mixed with 5-D). We therefore engage per-layer classification on a mixed
+    # stack even without an explicit ``kv_layout="PACKED"`` hint -- the hint is
+    # only needed to disambiguate a *uniform* all-4-D stack (packed slot vs
+    # fused 2*head_size), which ``normalize_kv_and_discover_format`` handles.
+    is_mixed_rank = is_vllm_layer_list and ranks == {4, 5}
+    engage_per_layer = is_vllm_layer_list and (is_packed_hint or is_mixed_rank)
+
+    if not engage_per_layer:
+        # Homogeneous (or non-vLLM) stack: one global format for every layer.
+        global_fmt, _ = normalize_kv_and_discover_format(
+            kv_caches, serving_engine, layout_hints
+        )
+        num_layers = len(kv_caches) if isinstance(kv_caches, (list, tuple)) else 1
+        return [global_fmt] * num_layers
+
+    packed = _packed_format()
+    if packed is None:
+        raise ValueError(
+            "A packed/mixed KV stack was detected but the LMCache compute "
+            "extension does not expose EngineKVFormat.NL_X_NB_BS_NH_PACKED "
+            "(rebuild csrc), and the pure-Python fallback enum is unavailable."
+        )
+
+    per_layer: list["lmc_ops.EngineKVFormat"] = []
+    for idx, layer in enumerate(kv_caches):
+        dim = layer.dim()
+        if dim == 4:
+            # [NB, BS, NH, slot_size] uint8 -> opaque packed combined K+V.
+            per_layer.append(packed)
+        elif dim == 5:
+            # [2, NB, BS, NH, HS] -> native (bf16) boundary layer. This is the
+            # canonical vLLM non-MLA flash-attention layout.
+            per_layer.append(lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS)
+        else:
+            raise ValueError(
+                f"packed/mixed-stack layer {idx} has unexpected rank {dim} "
+                f"(shape {tuple(layer.shape)}); expected 4-D packed or 5-D "
+                "native bf16."
+            )
+    return per_layer
+
 # Canonical recursive type consumed by :func:`normalize_kv_and_discover_format`
 # and the downstream format-aware helpers. A value is either a single
 # :class:`torch.Tensor` (e.g. vLLM cross-layer, TRT-LLM) or a list of
@@ -79,10 +196,11 @@ class LayoutHints(TypedDict, total=False):
         head_dim: Per-head dimension. Used by TRT-LLM (same).
     """
 
-    kv_layout: Literal["NHD", "HND"]
+    kv_layout: Literal["NHD", "HND", "PACKED"]
     num_kv_heads: int
     tokens_per_block: int
     head_dim: int
+    packed_slot_size: int
 
 
 def attempt_permute_to_contiguous_view(
@@ -307,6 +425,9 @@ def get_engine_kv_shape_description(engine_kv_format: "lmc_ops.EngineKVFormat") 
         lmc_ops.EngineKVFormat.NB_NL_TWO_NH_BS_HS: "[NB, NL, 2, NH, BS, HS]",
         lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS: "NL x [NB, NH, BS, 2, HS]",
     }
+    _packed = _packed_format()
+    if _packed is not None:
+        _SHAPE_DESCRIPTIONS[_packed] = "NL x [NB, BS, NH, SLOT] (packed)"
     return _SHAPE_DESCRIPTIONS.get(engine_kv_format, f"Unknown ({engine_kv_format})")
 
 
@@ -335,6 +456,11 @@ def get_attention_backend(engine_kv_format: "lmc_ops.EngineKVFormat") -> str:
             "vLLM non-MLA blocks-first, fused K/V"
         ),
     }
+    _packed = _packed_format()
+    if _packed is not None:
+        _ATTENTION_BACKENDS[_packed] = (
+            "vLLM packed-slot quantized KV (TurboQuant / FP4-g32 / FP8-g32)"
+        )
     return _ATTENTION_BACKENDS.get(engine_kv_format, f"Unknown ({engine_kv_format})")
 
 
@@ -413,6 +539,12 @@ def get_concrete_engine_kv_shape(
         nh = get_num_heads(kv_caches, fmt)
         bs = get_block_size(kv_caches, fmt)
         return f"{nl} x [{nb}, {nh}, {bs}, 2, {hs}]"
+
+    if _is_packed_format(fmt):
+        nb = get_num_blocks(kv_caches, fmt)
+        nh = get_num_heads(kv_caches, fmt)
+        bs = get_block_size(kv_caches, fmt)
+        return f"{nl} x [{nb}, {bs}, {nh}, {hs}(slot)]"
 
     return f"Unknown ({engine_kv_format})"
 
@@ -641,7 +773,28 @@ def normalize_kv_and_discover_format(
     list_dims = []
     for _ in range(list_depth):
         list_dims.append(len(probe))
-        probe = probe[0]
+        # For a PACKED stack the representative layer must be a packed (4-D)
+        # tensor. TurboQuant boundary protection can leave a few native bf16
+        # (5-D) layers at the front/back of the per-layer list; probing index
+        # 0 blindly would mis-detect the whole stack as standard bf16 and the
+        # transfer kernel would stride packed layers with bf16 geometry
+        # (out-of-bounds -> GPU fault). Pick the first 4-D entry instead.
+        if (
+            isinstance(probe, (list, tuple))
+            and layout_hints is not None
+            and layout_hints.get("kv_layout") == "PACKED"
+        ):
+            packed_probe = next(
+                (
+                    t
+                    for t in probe
+                    if isinstance(t, torch.Tensor) and t.dim() == 4
+                ),
+                None,
+            )
+            probe = packed_probe if packed_probe is not None else probe[0]
+        else:
+            probe = probe[0]
 
     tensor_dims = list(probe.shape)
     dims_str = (
@@ -660,7 +813,10 @@ def normalize_kv_and_discover_format(
         # however, get_kv_cache_layout from vllm.v1.attention.backends.utils
         # does not return the right layout for CPU attention.
         # Right fix should come from vllm side, but hardcode here as safeguard.
-        if torch_device_type == "cpu":
+        if torch_device_type == "cpu" and kv_layout != "PACKED":
+            # vLLM's CPU attention backend stores KV cache in HND layout, but
+            # an explicit PACKED hint describes a combined opaque slot and must
+            # never be coerced to HND (doing so would re-enable the K/V split).
             kv_layout = "HND"
             logger.info("CPU backend detected, using HND KV cache layout")
         elif kv_layout is None:
@@ -687,6 +843,24 @@ def normalize_kv_and_discover_format(
                         detected_format = lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
                     else:
                         detected_format = lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
+            elif tensor_dim == 4 and kv_layout == "PACKED":
+                # Combined-KV packed-slot quantized cache (TurboQuant TQ44
+                # FlyDSL v4 / FP4-g32 / FP8-g32): per-layer
+                # [NB, BS, NH, slot_size]. The trailing dim is an opaque
+                # packed byte slot holding BOTH K and V codes plus their fp16
+                # metadata for one (token, head). It is NOT 2 * head_size and
+                # MUST NOT be split — K and V have unequal byte widths and the
+                # SoA store keeps metadata in a per-block tail. The serving
+                # engine declares this explicitly via ``kv_layout="PACKED"``
+                # so discovery never falls into the fused-K/V heuristic below.
+                packed = _packed_format()
+                if packed is None:
+                    raise ValueError(
+                        "kv_layout='PACKED' requires the LMCache compute "
+                        "extension to expose EngineKVFormat.NL_X_NB_BS_NH_PACKED "
+                        "(rebuild csrc), or the pure-Python fallback enum."
+                    )
+                detected_format = packed
             elif tensor_dim == 4:
                 # vLLM non-MLA blocks-first attention: K/V fused into the
                 # trailing dim -> [NB, NH, BS, 2*head_size].
@@ -750,6 +924,9 @@ def get_num_layers(
         lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
     ):
         return len(kv_caches)
+    elif _is_packed_format(engine_kv_format):
+        # packed: list[num_layers] of [NB, BS, NH, slot]
+        return len(kv_caches)
     elif engine_kv_format in (
         lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         lmc_ops.EngineKVFormat.TWO_X_NL_X_NB_BS_NH_HS,
@@ -786,6 +963,9 @@ def get_num_blocks(
         # [num_blocks, ...] — shape[0] is num_blocks
         return kv_caches[0].shape[0]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
+        return kv_caches[0].shape[0]
+    elif _is_packed_format(engine_kv_format):
+        # packed: [NB, BS, NH, slot] — num_blocks at shape[0]
         return kv_caches[0].shape[0]
     elif engine_kv_format == lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS:
         # SGLang MHA 3-D inner: ``(page_buffer_size, num_heads, head_size)``
@@ -834,6 +1014,9 @@ def get_block_size(
         return kv_caches[layer_idx].shape[3]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         return kv_caches[layer_idx].shape[1]
+    elif _is_packed_format(engine_kv_format):
+        # packed: [NB, BS, NH, slot] — block_size at shape[1]
+        return kv_caches[layer_idx].shape[1]
     elif engine_kv_format == lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS:
         # SGLang MHA 3-D inner: block_size folded into shape[0]; not separable.
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=engine_kv_format))
@@ -876,6 +1059,9 @@ def get_page_buffer_size(
         # list[num_layers] of [num_blocks, num_heads, block_size, 2, head_size]
         # num_blocks=shape[0], block_size=shape[2]
         return kv_caches[0].shape[0] * kv_caches[0].shape[2]
+    elif _is_packed_format(engine_kv_format):
+        # list[num_layers] of [NB, BS, NH, slot]: NB=shape[0], BS=shape[1]
+        return kv_caches[0].shape[0] * kv_caches[0].shape[1]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         # list[num_layers] of [num_blocks, block_size, head_size]
         return kv_caches[0].shape[0] * kv_caches[0].shape[1]
@@ -920,6 +1106,9 @@ def get_num_heads(
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS:
         # CPU fused: [NB, NH, BS, 2, HS] — num_heads at shape[1]
         return kv_caches[layer_idx].shape[1]
+    elif _is_packed_format(engine_kv_format):
+        # packed: [NB, BS, NH, slot] — num_heads at shape[2]
+        return kv_caches[layer_idx].shape[2]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         # MLA: heads are absorbed into hidden dim, so num_heads = 1
         return 1
@@ -963,6 +1152,9 @@ def get_hidden_dim_size(
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS:
         # CPU fused: [NB, NH, BS, 2, HS] — hidden_dim = NH * HS = shape[1] * shape[4]
         return kv_caches[layer_idx].shape[1] * kv_caches[layer_idx].shape[4]
+    elif _is_packed_format(engine_kv_format):
+        # packed: [NB, BS, NH, slot] — hidden = NH * slot = shape[2] * shape[3]
+        return kv_caches[layer_idx].shape[2] * kv_caches[layer_idx].shape[3]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         return kv_caches[layer_idx].shape[2]
     elif engine_kv_format == lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS:
@@ -1003,6 +1195,10 @@ def get_head_size(
         return kv_caches[layer_idx].shape[4]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         return kv_caches[layer_idx].shape[2]
+    elif _is_packed_format(engine_kv_format):
+        # packed: [NB, BS, NH, slot] — the opaque packed slot size (carried as
+        # head_size; element_size == 1). NOT a logical per-head dim.
+        return kv_caches[layer_idx].shape[3]
     elif engine_kv_format in (
         lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         lmc_ops.EngineKVFormat.TWO_X_NL_X_NB_BS_NH_HS,
@@ -1050,6 +1246,9 @@ def get_tokens_per_layer(
         # list[num_layers] of [num_blocks, num_heads, block_size, 2, head_size]
         # tokens = NB * BS = shape[0] * shape[2]
         return kv_caches[0].shape[0] * kv_caches[0].shape[2]
+    elif _is_packed_format(engine_kv_format):
+        # list[num_layers] of [NB, BS, NH, slot]; tokens = NB * BS
+        return kv_caches[0].shape[0] * kv_caches[0].shape[1]
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         # list[num_layers] of [num_blocks, block_size, head_size]
         return kv_caches[0].shape[0] * kv_caches[0].shape[1]
@@ -1106,6 +1305,9 @@ def get_elements_per_layer(
         # [NB, NH, BS, 2, HS] — K/V at dim 3; k_cache is kv_caches[0][:, :, :, 0]
         k_cache_shape = kv_caches[0][:, :, :, 0].shape
         return k_cache_shape.numel() * 2
+    elif _is_packed_format(engine_kv_format):
+        # packed: [NB, BS, NH, slot] is one combined K+V plane; no *2.
+        return kv_caches[0].numel()
     elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS:
         # list[num_layers] of [num_blocks, block_size, head_size] (MLA)
         return kv_caches[0].numel()
@@ -1210,6 +1412,9 @@ def get_dtype(
         lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
     ):
         return kv_caches[layer_idx].dtype
+    elif _is_packed_format(engine_kv_format):
+        # packed: list[num_layers] of [NB, BS, NH, slot] uint8
+        return kv_caches[layer_idx].dtype
     elif engine_kv_format in (
         lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         lmc_ops.EngineKVFormat.TWO_X_NL_X_NB_BS_NH_HS,
@@ -1270,6 +1475,10 @@ def get_group_data_ptrs(
         F.NL_X_NBBS_ONE_HS,
         F.NL_X_NB_NH_BS_TWO_HS,
     ):
+        layers = cast(list[torch.Tensor], kv_caches)
+        return [layers[i].data_ptr() for i in layer_indices]
+    if _is_packed_format(engine_kv_format):
+        # packed: per-layer list of [NB, BS, NH, slot]; one pointer per layer.
         layers = cast(list[torch.Tensor], kv_caches)
         return [layers[i].data_ptr() for i in layer_indices]
     raise ValueError(f"Unknown GPU KV Format: {engine_kv_format}")
@@ -1472,15 +1681,18 @@ def make_page_buffer_shape_desc(
         A populated ``PageBufferShapeDesc``.
     """
     desc = lmc_ops.PageBufferShapeDesc()
-    desc.kv_size = 1 if is_mla(engine_kv_format) else 2
+    # Packed slots carry BOTH K and V in one opaque run (combined plane), so
+    # kv_size == 1 like MLA, but heads are real (not absorbed) and the trailing
+    # "hs" is the packed slot byte size.
+    packed = _is_packed_format(engine_kv_format)
+    desc.kv_size = 1 if (is_mla(engine_kv_format) or packed) else 2
     desc.nl = num_layers_in_group
     desc.nb = num_blocks
     desc.bs = block_size
-    desc.nh = (
-        1
-        if is_mla(engine_kv_format)
-        else get_num_heads(kv_caches, engine_kv_format, layer_idx)
-    )
+    if is_mla(engine_kv_format):
+        desc.nh = 1
+    else:
+        desc.nh = get_num_heads(kv_caches, engine_kv_format, layer_idx)
     desc.hs = get_head_size(kv_caches, engine_kv_format, layer_idx)
     dtype = get_dtype(kv_caches, engine_kv_format, layer_idx)
     desc.element_size = dtype.itemsize

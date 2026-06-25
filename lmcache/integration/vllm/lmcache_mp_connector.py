@@ -624,7 +624,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         engine_group_infos = create_engine_group_infos_from_vllm(
             kv_cache_config,
             kv_caches,
-            layout_hints=vllm_layout_hints(),
+            layout_hints=vllm_layout_hints(kv_caches),
         )
         self.worker_adapter.register_kv_caches(
             kv_caches, engine_group_infos=engine_group_infos

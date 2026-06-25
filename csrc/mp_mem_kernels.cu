@@ -52,6 +52,10 @@ __device__ inline size_t calculate_engine_global_offset(
   } else if constexpr (format == EngineKVFormat::NL_X_NB_BS_HS) {
     // MLA: L tensors [NB, BS, HS]
     return engine_block_idx * scalars_per_block;
+  } else if constexpr (format == EngineKVFormat::NL_X_NB_BS_NH_PACKED) {
+    // Packed combined-KV: L tensors [NB, BS, NH, slot]. kv_size == 1, so the
+    // whole block is one opaque run; same block-level stride as MLA.
+    return engine_block_idx * scalars_per_block;
   } else if constexpr (format == EngineKVFormat::TWO_X_NL_X_NBBS_NH_HS) {
     // SGLang MHA (in-process): 2L tensors [NBBS, NH, HS]
     return engine_block_idx * scalars_per_block;
@@ -287,6 +291,9 @@ __global__ void multi_layer_block_transfer_kernel(
       break;                                                            \
     case EngineKVFormat::NL_X_NBBS_ONE_HS:                              \
       LAUNCH_KERNEL(DIRECTION, EngineKVFormat::NL_X_NBBS_ONE_HS);       \
+      break;                                                            \
+    case EngineKVFormat::NL_X_NB_BS_NH_PACKED:                          \
+      LAUNCH_KERNEL(DIRECTION, EngineKVFormat::NL_X_NB_BS_NH_PACKED);   \
       break;                                                            \
     case EngineKVFormat::NB_NL_TWO_NH_BS_HS:                            \
       LAUNCH_KERNEL(DIRECTION, EngineKVFormat::NB_NL_TWO_NH_BS_HS);     \

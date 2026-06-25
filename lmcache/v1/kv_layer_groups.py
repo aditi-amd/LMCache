@@ -56,6 +56,12 @@ class KernelGroupIdentity(NamedTuple):
     block_size: int
     engine_group_idx: int
     dtype: torch.dtype
+    # Per-group ``EngineKVFormat`` as an int (enums are not hashable across the
+    # compiled/fallback boundary; the int value is the stable key). Defaults to
+    # -1 for homogeneous-stack callers that pass a single global format and do
+    # not vary format per layer; mixed-format (TQ44 boundary-protected) stacks
+    # set this so packed (4-D) and native bf16 (5-D) layers never share a group.
+    engine_kv_format_int: int = -1
 
 
 LayerGroupIdentity = KernelGroupIdentity  # Alias for compatibility
@@ -67,11 +73,24 @@ LayerGroupIdentity = KernelGroupIdentity  # Alias for compatibility
 EXCLUDED_ENGINE_GROUP = -1
 
 
+def _engine_kv_format_from_int(fmt_int: int) -> "lmc_ops.EngineKVFormat":
+    """Reconstruct the active ``EngineKVFormat`` enum from its int value.
+
+    ``KernelGroupIdentity.engine_kv_format_int`` stores the format as a plain
+    int (enums are not reliably hashable / comparable across the
+    compiled-vs-fallback ``lmc_ops`` boundary). Both the pybind11 compiled enum
+    and the pure-Python ``IntEnum`` fallback construct from their int value, so
+    ``EngineKVFormat(fmt_int)`` round-trips on whichever backend is active.
+    """
+    return lmc_ops.EngineKVFormat(fmt_int)
+
+
 def group_layers_by_identity(
     kv_caches: "DiscoverableKVCache",
     engine_kv_format: "lmc_ops.EngineKVFormat",
     num_layers: int,
     per_layer_engine_group_idx: Sequence[int] | None = None,
+    per_layer_format: Sequence["lmc_ops.EngineKVFormat"] | None = None,
 ) -> list[tuple[LayerGroupIdentity, list[int]]]:
     """Partition layer indices by :data:`LayerGroupIdentity`.
 
@@ -83,6 +102,8 @@ def group_layers_by_identity(
             and dtype.
         engine_kv_format: Format descriptor returned by
             :func:`normalize_kv_and_discover_format`, used to read heads/sizes.
+            For mixed-format stacks this is the *fallback* / representative
+            format; per-layer formats come from ``per_layer_format``.
         num_layers: Number of registered KV tensors to partition.
         per_layer_engine_group_idx: Optional per-registered-index engine
             block group id. When ``None`` every layer is treated as block group
@@ -91,6 +112,14 @@ def group_layers_by_identity(
             Layers whose value is ``EXCLUDED_ENGINE_GROUP`` are left out of all
             groups (e.g. cross-layer KV-sharing layers whose KV lives in their
             target owner's blocks).
+        per_layer_format: Optional per-registered-index ``EngineKVFormat``. When
+            present (mixed-format stacks, e.g. TurboQuant TQ44 boundary
+            protection where some layers are packed 4-D and others native bf16
+            5-D), each layer's shape/dtype is read with *its own* format and the
+            format becomes part of the group identity, so packed and bf16 layers
+            land in separate kernel groups. When ``None`` (homogeneous stacks)
+            ``engine_kv_format`` is used for every layer and the identity's
+            format slot stays at the -1 sentinel for backward compatibility.
 
     Returns:
         A list of ``(identity, layer_indices)`` pairs sorted by each group's
@@ -106,8 +135,12 @@ def group_layers_by_identity(
         is_mla,
     )
 
-    mla = is_mla(engine_kv_format)
-    kv_size = 1 if mla else 2
+    if per_layer_format is not None and len(per_layer_format) != num_layers:
+        raise ValueError(
+            f"per_layer_format has {len(per_layer_format)} entries for "
+            f"{num_layers} layers"
+        )
+
     groups_dict: dict[LayerGroupIdentity, list[int]] = defaultdict(list)
     for idx in range(num_layers):
         engine_group_idx = (
@@ -119,10 +152,18 @@ def group_layers_by_identity(
         # KV-sharing layers, whose KV lives in their target owner's blocks).
         if engine_group_idx == EXCLUDED_ENGINE_GROUP:
             continue
-        nh = 1 if mla else get_num_heads(kv_caches, engine_kv_format, idx)
-        hs = get_head_size(kv_caches, engine_kv_format, idx)
-        dt = get_dtype(kv_caches, engine_kv_format, idx)
-        bs = get_block_size(kv_caches, engine_kv_format, idx)
+
+        layer_format = (
+            per_layer_format[idx]
+            if per_layer_format is not None
+            else engine_kv_format
+        )
+        mla = is_mla(layer_format)
+        kv_size = 1 if mla else 2
+        nh = 1 if mla else get_num_heads(kv_caches, layer_format, idx)
+        hs = get_head_size(kv_caches, layer_format, idx)
+        dt = get_dtype(kv_caches, layer_format, idx)
+        bs = get_block_size(kv_caches, layer_format, idx)
 
         identity = LayerGroupIdentity(
             kv_size=kv_size,
@@ -131,6 +172,9 @@ def group_layers_by_identity(
             block_size=bs,
             engine_group_idx=engine_group_idx,
             dtype=dt,
+            engine_kv_format_int=(
+                int(layer_format) if per_layer_format is not None else -1
+            ),
         )
         groups_dict[identity].append(idx)
     return sorted(groups_dict.items(), key=lambda kv: kv[1][0])
@@ -184,6 +228,13 @@ class KernelGroupInfo:
     sw_size_tokens: int = -1
     """Sliding window size in logical tokens for this group's layers.
     ``-1`` means the layers are not sliding-window attention."""
+    engine_kv_format: "lmc_ops.EngineKVFormat | None" = None
+    """Per-group ``EngineKVFormat`` used to dispatch this group's transfer
+    kernel. For homogeneous stacks every group shares the connector's global
+    format and this may stay ``None`` (callers fall back to the global format).
+    For mixed-format stacks (TQ44 boundary protection: packed 4-D middle layers
+    + native bf16 5-D boundary layers) each group carries its own format so
+    ``multi_layer_kv_transfer`` strides each group with the correct geometry."""
 
     def __repr__(self) -> str:
         if not self.layer_indices:
@@ -281,6 +332,7 @@ class KVLayerGroupsManager:
         num_blocks: int,
         engine_group_infos: "Sequence[EngineGroupInfo]" = (),
         lmcache_tokens_per_chunk: int = 256,
+        per_layer_format: "Sequence[lmc_ops.EngineKVFormat] | None" = None,
     ) -> None:
         """Partition layers into groups keyed by
         :data:`LayerGroupIdentity`.
@@ -326,8 +378,18 @@ class KVLayerGroupsManager:
             engine_group_infos, num_layers
         )
 
+        if per_layer_format is not None and len(per_layer_format) != num_layers:
+            raise ValueError(
+                f"per_layer_format has {len(per_layer_format)} entries for "
+                f"{num_layers} layers"
+            )
+
         groups_by_identity = group_layers_by_identity(
-            kv_caches, engine_kv_format, num_layers, per_layer_engine_group_idx
+            kv_caches,
+            engine_kv_format,
+            num_layers,
+            per_layer_engine_group_idx,
+            per_layer_format=per_layer_format,
         )
 
         # Engine group infos are produced by the same group_layers_by_identity
@@ -342,18 +404,26 @@ class KVLayerGroupsManager:
 
         # Emit groups in order of their first-appearing layer so that group
         # indices remain deterministic across runs.
-        for group_idx, ((_, _, _, bs, engine_group_idx, dt), indices) in enumerate(
-            groups_by_identity
-        ):
+        for group_idx, (identity, indices) in enumerate(groups_by_identity):
+            (_, _, _, bs, engine_group_idx, dt, fmt_int) = identity
+            # Per-group format: for mixed stacks each group carries its own
+            # EngineKVFormat (packed vs bf16) so shape parsing and the eventual
+            # kernel dispatch use the right geometry. Homogeneous stacks leave
+            # fmt_int at the -1 sentinel and fall back to the global format.
+            group_format = (
+                _engine_kv_format_from_int(fmt_int)
+                if fmt_int >= 0
+                else engine_kv_format
+            )
             block_stride_elems = resolve_block_stride_and_log_layout(
                 kv_caches,
-                engine_kv_format,
+                group_format,
                 layer_idx=indices[0],
                 group_idx=group_idx,
             )
             shape_desc = make_page_buffer_shape_desc(
                 kv_caches,
-                engine_kv_format,
+                group_format,
                 layer_idx=indices[0],
                 num_layers_in_group=len(indices),
                 num_blocks=num_blocks,
@@ -395,6 +465,7 @@ class KVLayerGroupsManager:
                     tokens_per_block=tokens_per_block,
                     engine_group_idx=engine_group_idx,
                     sw_size_tokens=sw_size_tokens,
+                    engine_kv_format=group_format,
                 )
             )
 

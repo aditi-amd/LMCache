@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 import abc
 
 # Third Party
@@ -17,6 +17,7 @@ from lmcache.v1.gpu_connector.utils import (
     assert_is_vllm_flash_attn_or_flash_infer,
     assert_is_vllm_mla_or_flash_attn_or_flash_infer,
     attempt_permute_to_contiguous_view,
+    detect_per_layer_formats,
     get_block_size,
     get_device,
     get_elements_per_layer,
@@ -138,6 +139,20 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             # the physical (HND) shape for correct kernel indexing.
             # attempt_permute_to_contiguous_view is a no-op when already contiguous.
             self.kvcaches = attempt_permute_to_contiguous_view(self.kvcaches)
+
+    def register_kv_caches(self, kvcaches: List[torch.Tensor]) -> None:
+        """Eagerly bind the registered KV tensors to this connector.
+
+        Called by the serving-engine adapter as soon as the engine has
+        allocated its KV caches, i.e. *before* the first store/retrieve
+        allocates a transfer buffer. Connectors whose per-group transfer
+        geometry must be known at allocation time (so that
+        ``metadata.get_shapes()/get_dtypes()`` return the correct per-group
+        layout) override this to build their group metadata now rather than
+        lazily on the first transfer. Default is a no-op for connectors that
+        discover geometry lazily and use a single global geometry.
+        """
+        return None
 
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
@@ -461,19 +476,82 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         if self.init:
             return
 
+        # The GPU connector is created at engine-build time, before vLLM has
+        # allocated the KV tensors, so the serving-engine adapter cannot inspect
+        # them to emit a ``kv_layout="PACKED"`` hint up front. Now that the real
+        # tensors are in hand, classify the stack:
+        #
+        #   uniform_packed : every per-layer tensor is 4-D (combined packed
+        #                    slot). Inject ``kv_layout=PACKED`` so the *global*
+        #                    discovery probe (which reads kv_caches[0]) keeps the
+        #                    opaque slot intact instead of splitting the even
+        #                    trailing dim into a spurious ``2 * head_size`` pair.
+        #   mixed          : a mix of 4-D packed and 5-D bf16 (TQ44 boundary
+        #                    protection). Do NOT inject a global PACKED hint --
+        #                    kv_caches[0] is a 5-D bf16 boundary layer, and a
+        #                    global packed format would make get_num_blocks read
+        #                    its K/V axis (shape[0]==2) as num_blocks. The global
+        #                    format/blocks/block_size are instead read with
+        #                    layer 0's own per-layer format; per-group geometry
+        #                    comes from KVLayerGroupsManager below.
+        ranks = (
+            {t.dim() for t in self.kvcaches}
+            if isinstance(self.kvcaches, (list, tuple))
+            else set()
+        )
+        uniform_packed = ranks == {4}
+        if uniform_packed and self.layout_hints.get("kv_layout") != "PACKED":
+            slot = next(
+                (
+                    int(t.shape[3])
+                    for t in self.kvcaches
+                    if isinstance(t, torch.Tensor) and t.dim() == 4
+                ),
+                None,
+            )
+            self.layout_hints = {**self.layout_hints, "kv_layout": "PACKED"}
+            if slot is not None:
+                self.layout_hints["packed_slot_size"] = slot
+            logger.info(
+                "VLLMPagedMemGPUConnectorV3 self-detected uniform packed-slot "
+                "KV (slot_size=%s); injecting kv_layout=PACKED for discovery.",
+                slot,
+            )
+
         self.engine_kv_format, self.kvcaches = normalize_kv_and_discover_format(
             self.kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
         )
-        self.num_blocks = get_num_blocks(self.kvcaches, self.engine_kv_format)
-        self.block_size = get_block_size(self.kvcaches, self.engine_kv_format)
+        # Per-layer format detection: a mixed-format stack (TQ44 boundary
+        # protection -> packed 4-D uint8 middle layers + native bf16 5-D
+        # boundary layers) cannot be described by the single format that
+        # ``normalize_kv_and_discover_format`` returns from probing one layer.
+        # ``detect_per_layer_formats`` classifies each layer so the groups
+        # manager can split packed and bf16 layers into separate kernel groups
+        # with their own geometry. Homogeneous stacks get one format repeated,
+        # so grouping behaviour is unchanged for them.
+        per_layer_format = detect_per_layer_formats(
+            self.kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
+        )
+        mixed_format = len(set(int(f) for f in per_layer_format)) > 1
+
+        # Global num_blocks/block_size/page_buffer_size are read from layer 0
+        # using *its own* format so a mixed stack (whose layer 0 is a 5-D bf16
+        # boundary layer) is measured correctly even though the connector-global
+        # ``engine_kv_format`` may differ from layer 0's format. num_blocks and
+        # block_size are identical across groups (shared paged allocator), so
+        # layer 0 is a valid representative for these global scalars.
+        layer0_format = per_layer_format[0] if per_layer_format else self.engine_kv_format
+        self.num_blocks = get_num_blocks(self.kvcaches, layer0_format)
+        self.block_size = get_block_size(self.kvcaches, layer0_format)
         self.page_buffer_size = self.num_blocks * self.block_size
-        self.head_size = get_head_size(self.kvcaches, self.engine_kv_format)
+        self.head_size = get_head_size(self.kvcaches, layer0_format)
 
         if self.metadata.kv_layer_groups_manager is None:
             self.metadata.kv_layer_groups_manager = KVLayerGroupsManager(
                 self.kvcaches,
                 engine_kv_format=self.engine_kv_format,
                 num_blocks=self.num_blocks,
+                per_layer_format=per_layer_format if mixed_format else None,
             )
         klg_manager = self.metadata.kv_layer_groups_manager
 
@@ -512,18 +590,53 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             ]
 
         self.group_kv_cache_pointers_on_gpu = []
-        for group in klg_manager.kv_layer_groups:
+        # Per-group transfer geometry. For a homogeneous stack every group
+        # shares the connector's global format/head_size/block_size; for a
+        # mixed-format stack (TQ44 boundary protection: packed 4-D uint8 middle
+        # layers + native bf16 5-D boundary layers) each group carries its own
+        # EngineKVFormat / head_size / block_size so its kernel launch strides
+        # the right geometry. ``KernelGroupInfo.engine_kv_format`` is populated
+        # by KVLayerGroupsManager from the per-layer format detection; fall back
+        # to the connector-global format when a group does not set it.
+        self.group_engine_kv_format: list[Any] = []
+        self.group_head_size: list[int] = []
+        self.group_block_size: list[int] = []
+        for group in klg_manager.kernel_groups:
+            group_format = group.engine_kv_format or self.engine_kv_format
             ptrs = get_group_data_ptrs(
-                self.kvcaches, self.engine_kv_format, group.layer_indices
+                self.kvcaches, group_format, group.layer_indices
             )
             cpu = torch.empty(len(ptrs), dtype=torch.int64, device="cpu")
             cpu.numpy()[:] = ptrs
             gpu = torch.empty(len(ptrs), dtype=torch.int64, device=self.device)
             gpu.copy_(cpu)
             self.group_kv_cache_pointers_on_gpu.append(gpu)
+            self.group_engine_kv_format.append(group_format)
+            # shape_desc.hs is the per-group head_size (packed slot byte size for
+            # packed groups); shape_desc.bs is the per-group block_size.
+            self.group_head_size.append(group.shape_desc.hs)
+            self.group_block_size.append(group.shape_desc.bs)
 
         self.init = True
         logger.info("init kv cache pointers success in VLLMPagedMemGPUConnectorV3")
+
+    def register_kv_caches(self, kvcaches: List[torch.Tensor]) -> None:
+        """Eagerly build the per-group geometry from the registered tensors.
+
+        The store/retrieve path allocates each transfer buffer from
+        ``metadata.get_shapes()/get_dtypes()`` *before* it calls
+        ``from_gpu``/``to_gpu``. Those accessors return per-group shapes only
+        once ``metadata.kv_layer_groups_manager`` exists. For a mixed
+        packed/bf16 stack the manager is built inside
+        ``_initialize_kv_cache_pointers`` (a per-transfer hook), which on the
+        very first store would run *after* allocation -- yielding a
+        single-group buffer that the per-group transfer then overruns (GPU
+        fault). Binding the caches and forcing pointer/group init here, at
+        registration time, guarantees the groups manager is populated before
+        the first allocation so every transfer buffer is sized per group.
+        """
+        self.kvcaches = attempt_permute_to_contiguous_view(kvcaches)
+        self._initialize_kv_cache_pointers()
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -557,9 +670,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 self.device,
                 self.page_buffer_size,
                 lmc_ops.TransferDirection.H2D,
-                self.engine_kv_format,
-                block_size=self.block_size,
-                head_size=self.head_size,
+                self.group_engine_kv_format[i],
+                block_size=self.group_block_size[i],
+                head_size=self.group_head_size[i],
                 skip_prefix_n_tokens=skip_prefix_n_tokens,
             )
 
@@ -588,9 +701,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                         self.device,
                         self.page_buffer_size,
                         lmc_ops.TransferDirection.D2H,
-                        self.engine_kv_format,
-                        block_size=self.block_size,
-                        head_size=self.head_size,
+                        self.group_engine_kv_format[i],
+                        block_size=self.group_block_size[i],
+                        head_size=self.group_head_size[i],
                     )
             else:
                 # kvcaches -> gpu_buffer -> memobj
@@ -606,9 +719,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                         self.device,
                         self.page_buffer_size,
                         lmc_ops.TransferDirection.D2H,
-                        self.engine_kv_format,
-                        block_size=self.block_size,
-                        head_size=self.head_size,
+                        self.group_engine_kv_format[i],
+                        block_size=self.group_block_size[i],
+                        head_size=self.group_head_size[i],
                     )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None

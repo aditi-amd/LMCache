@@ -4,12 +4,15 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.mock_gpu_connector import MockGPUConnector
 from lmcache.v1.gpu_connector.utils import LayoutHints, need_gpu_interm_buffer
 from lmcache.v1.metadata import LMCacheMetadata
+
+logger = init_logger(__name__)
 
 # Boolean config flags whose underlying implementations exist only on a
 # subset of accelerators. Each entry is ``(attr_name, human_label,
@@ -174,7 +177,25 @@ def CreateGPUConnector(
                         metadata, use_gpu, device, layout_hints=layout_hints
                     )
 
-            if config.use_gpu_connector_v3:
+            # Auto-select the group-aware V3 connector for quantized
+            # (combined packed-slot) KV caches. TurboQuant TQ44 / FP4-g32 /
+            # FP8-g32 register a uint8 KV container, and with boundary
+            # protection the stack is *mixed* (packed 4-D uint8 middle layers +
+            # native bf16 5-D boundary layers). V2 issues a single-geometry
+            # transfer over the whole stack, which strides the packed layers
+            # with bf16 geometry -> GPU memory fault. V3 transfers per geometry
+            # group and is the only connector that can serve a mixed stack.
+            # uint8 as a KV container dtype is unambiguous for these quantized
+            # backends, so it is a safe trigger that needs no benchmark/env
+            # change. An explicit ``use_gpu_connector_v3`` still forces V3.
+            force_v3_for_quantized_kv = metadata.kv_dtype == torch.uint8
+            if force_v3_for_quantized_kv and not config.use_gpu_connector_v3:
+                logger.info(
+                    "Detected uint8 (packed-slot quantized) KV cache; "
+                    "selecting VLLMPagedMemGPUConnectorV3 for per-group "
+                    "transfer (required for mixed packed/bf16 stacks)."
+                )
+            if config.use_gpu_connector_v3 or force_v3_for_quantized_kv:
                 return VLLMPagedMemGPUConnectorV3.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
