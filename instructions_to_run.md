@@ -18,15 +18,15 @@ Two repos — the vLLM fork (carries the quantized **KV kernels**) and this LMCa
 
 ```bash
 # vLLM fork — KV kernels (TurboQuant / FP4 / fp8_g32)
-git clone -b flydsl_fp8scalekernel https://github.com/aditi-amd/vllm.git
-#   branch: flydsl_fp8scalekernel   (pinned commit 0136dd2ae)
+git clone -b feat/fp8scalekernel https://github.com/aditi-amd/vllm.git
+#   branch: feat/fp8scalekernel   (pinned commit 0136dd2ae)
 
 # LMCache fork — this repo, group-aware packed connector
 git clone -b feat/ultralmcache-mi355-packed-kv https://github.com/aditi-amd/LMCache.git
 #   branch: feat/ultralmcache-mi355-packed-kv   (commit 6e931e7)
 ```
 
-Branch link: <https://github.com/aditi-amd/vllm/tree/flydsl_fp8scalekernel>
+Branch link: <https://github.com/aditi-amd/vllm/tree/feat/fp8scalekernel>
 
 ---
 
