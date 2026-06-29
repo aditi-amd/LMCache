@@ -7,7 +7,7 @@ offload** on **AMD Instinct MI355X (gfx950, TP=2)** in three KV-cache formats:
 |---|---|---|
 | **BF16** (baseline) | stock 16-bit KV | vLLM branch only |
 | **TQ44v4** | 4-bit TurboQuant packed KV | vLLM branch + **FlyDSL** kernels |
-| **fp8g32** | UltraQuant FP4-g32 packed KV | vLLM branch only (pure-Triton kernel) |
+| **fp8g32** | UltraQuant FP4-g32 packed KV | vLLM branch + **FlyDSL** kernels (V4 decode; pure-Triton V3 fallback) |
 
 ---
 
@@ -41,12 +41,43 @@ pip install -e . --no-build-isolation
 cd ../LMCache
 BUILD_WITH_HIP=1 ROCM_PATH=/opt/rocm pip install -e . --no-build-isolation
 
-# (c) FlyDSL — TQ44v4 only (skip for BF16 / fp8g32)
-#     prebuilt at /root/FlyDSL/build-fly/python_packages  (commit 41500b0)
+# (c) FlyDSL — required for the V4 decode kernels used by BOTH TQ44v4 and fp8g32
+#     (skip only for BF16). Build once per machine (~5 min; needs ROCm 7.x hipcc,
+#     cmake>=3.20, ninja, Python 3.12). Source: vllm-pr/HOW_TO_RUN.md "Part 1".
 
 # verify
 python3 -c "import lmcache, vllm; print('lmcache + vllm OK')"
 ```
+
+### 2.1 FlyDSL build (TQ44v4 / fp8g32 only — skip for BF16)
+
+```bash
+# pinned, machine-tested build (matches the measured config)
+git clone https://github.com/ROCm/FlyDSL.git /opt/FlyDSL   # or your internal mirror
+cd /opt/FlyDSL
+git checkout 41500b0                 # tested SHA the kernels were validated against
+mkdir -p build-fly && cd build-fly
+cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON
+ninja -j"$(nproc)"                   # ~5 min -> build-fly/python_packages/flydsl
+
+# verify the package imports
+python3 -c "import sys; sys.path.insert(0,'/opt/FlyDSL/build-fly/python_packages'); import flydsl; print('FlyDSL OK:', flydsl.__version__)"
+```
+
+> **You do NOT need to export `PYTHONPATH` yourself** — the `common_tq44.env` /
+> `common_fp8g32.env` overlays prepend FlyDSL to `PYTHONPATH` via
+> `VLLM_FLYDSL_ROOT` / `VLLM_FLYDSL_PKGS`. Point those at your build if it isn't at
+> the default `/root/FlyDSL`:
+>
+> ```bash
+> export VLLM_FLYDSL_ROOT=/opt/FlyDSL
+> export VLLM_FLYDSL_PKGS=/opt/FlyDSL/build-fly/python_packages
+> ```
+>
+> **Alternative (no source build):** the AMD nightly wheel for gfx942/gfx950 —
+> `uv pip install --extra-index-url https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/ flydsl`
+> (a wheel install puts `flydsl` on the normal import path; the pinned-SHA source
+> build above is what the measured numbers used).
 
 ---
 
@@ -146,6 +177,6 @@ If the 2nd pass is still `0`, the hash settings are wrong — fix before measuri
 - Keep `--enable-prefix-caching` **on** even with LMCache (LMCache reuses vLLM's hash fn).
 - `PYTHONHASHSEED=0` + `sha256` are **mandatory** at TP>1 (handled by the serve script).
 - **TQ44v4 only:** `VLLM_ROCM_USE_AITER=0`, butterfly flags OFF, `VLLM_TQ_SOA_FUSION_STORE=1`.
-- **fp8g32 only:** `VLLM_FP8_G32_V3=1` is the enable flag (vLLM may log it as "unknown" — benign).
+- **fp8g32 only:** default kernel is **FlyDSL V4 decode** (`VLLM_FP8_G32_DECODE_V4=1`), with the pure-Triton `VLLM_FP8_G32_V3=1` as fallback (vLLM may log the flag as "unknown" — benign). Needs FlyDSL on `PYTHONPATH` like TQ44v4.
 - Use **token-matched** `gmu`/L2 for the 4-bit formats (the env files compute these) — byte-matching never fills the tiers and makes B and C tie.
-- BF16 is reproducible on stock upstream vLLM; **TQ44v4/fp8g32 need the vLLM fork above** (and FlyDSL for TQ44v4).
+- BF16 is reproducible on stock upstream vLLM; **TQ44v4/fp8g32 need the vLLM fork above** (and FlyDSL for both TQ44v4 and fp8g32's default V4 path).
