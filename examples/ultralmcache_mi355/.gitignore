@@ -1,0 +1,6 @@
+# Generated at run time (BENCH_DIR defaults to this folder)
+logs/
+logs_*/
+results/
+results_*/
+server_meta_*.env
